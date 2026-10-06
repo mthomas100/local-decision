@@ -1,0 +1,15 @@
+# Kept out of git (2026-10-03). Weights live in ~/models; the rest is rebuilt or per-run.
+# llama.cpp release build: re-download per README
+vendor/
+# MLX venv: re-create from requirements.lock
+.venv/
+# live server state and logs
+run/
+__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+.DS_Store
+
+# fetched dataset rows (bench/usecases.py prepare)
+bench/data/.cache/

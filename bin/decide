@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""decide — run local decision models (Cloudflare's Clef and the like) on this Mac.
+
+usage:
+  decide list                          every model in models.toml: engine, inputs, on disk, trust
+  decide gpu                           is the GPU free? (m3d's guard when installed)
+  decide serve [TARGET] [--force]      start TARGET on 127.0.0.1:8097 and wait until it answers
+  decide status                        what is running
+  decide ask REQUEST [--image F]...    POST /v1/systemone; REQUEST is JSON text, a .json file or -
+  decide smoke                         run the planted controls in tests/smoke.json against it
+  decide stop                          stop it (SIGINT, then SIGTERM; never SIGKILL)
+  decide test [TARGET|all] [--force]   serve, smoke, stop: one target, or every target on disk
+  decide fetch [TARGET|all]            download the pinned weights named in models.toml
+
+A decision model answers typed questions (noul, choice, score) about a state with
+a probability for every option, in one forward pass, through the Jev/SystemOne API.
+It cannot chat, so it gets its own small server manager instead of a row in a chat-model
+front end. Every model, engine and path is in ../models.toml; this script only reads it.
+
+Why this shape (2026-10-03): a chat-model router such as llama-swap would offer Clef to
+every chat client as a broken chat model (it advertises every model as text-out with
+tools). Two rules from running local models on a Mac still hold: one GPU job at a time,
+and never SIGKILL a model server, because that leaks wired Metal memory until a
+reboot (observed 2026-09-11).
+
+Exit codes: 0 ok, 1 a smoke check failed, 2 usage, 3 GPU busy, 4 a server failed
+to start, answer or stop, 5 weights missing.
+"""
+import base64
+import datetime as dt
+import json
+import os
+import shutil
+import signal
+import socket
+import statistics
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CFG = tomllib.loads((ROOT / "models.toml").read_text())
+MODELS = CFG["models"]
+SRV = CFG["server"]
+RUN = ROOT / "run"
+STATE = RUN / "server.json"
+RUNS = ROOT / "bench" / "runs.tsv"
+SMOKE = ROOT / "tests" / "smoke.json"
+LOAD_TIMEOUT_S = 900   # a cold 30 GB MLX load from disk; llama-server is far quicker
+STOP_WAIT_S = (180, 120)  # after SIGINT, then after SIGTERM: the rig's unloadTimeout
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def die(code, msg):
+    print(f"decide: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------- registry ----------
+def fill(text, **extra):
+    """Replace {root}, {models}, [paths] keys, [server] keys and extras, repeatedly,
+    so a path may itself name another placeholder."""
+    vals = {"root": str(ROOT), **{k: str(v) for k, v in SRV.items()}}
+    vals["models"] = os.path.expanduser(CFG["paths"]["models"])
+    vals.update({k: str(v) for k, v in extra.items()})
+    for k, v in CFG["paths"].items():
+        if k != "models":
+            vals.setdefault(k, v)
+    for _ in range(4):
+        new = text
+        for k, v in vals.items():
+            new = new.replace("{" + k + "}", v)
+        if new == text:
+            break
+        text = new
+    return os.path.expanduser(text)
+
+
+def row(target):
+    if target not in MODELS:
+        die(2, f"unknown target {target!r}; known: {', '.join(MODELS)}")
+    return MODELS[target]
+
+
+def weights(target):
+    return Path(fill(row(target)["weights"]))
+
+
+def on_disk(target):
+    """Size in GB if the weights are fully present, else None. An MLX row is a folder;
+    it counts as present only with the head, the index and every shard the index names."""
+    w = weights(target)
+    if row(target)["engine"] == "mlx":
+        idx = w / "model.safetensors.index.json"
+        if not (w.is_dir() and idx.exists() and (w / "joint_head.safetensors").exists()):
+            return None
+        shards = set(json.loads(idx.read_text())["weight_map"].values())
+        if not all((w / s).exists() for s in shards):
+            return None
+        return sum(f.stat().st_size for f in w.rglob("*") if f.is_file()) / 1e9
+    return w.stat().st_size / 1e9 if w.is_file() else None
+
+
+def command(target):
+    r = row(target)
+    eng = CFG["engines"][r["engine"]]
+    return [fill(a, weights=weights(target), ctx=r["ctx"], target=target) for a in eng["cmd"]]
+
+
+def base_url():
+    return f"http://{SRV['host']}:{SRV['port']}"
+
+
+# ---------- GPU guard ----------
+def hold_holder():
+    """The Mac's GPU hold (2026-10-04, the hold gate in the local-rig repo, docs/hold.md): while a render, an m3d job
+    or a person's `hold on` holds the GPU, no model may be loaded, this one included (the rule: nothing forces an LLM
+    back on while the GPU is held on purpose). None when the gate is open, or when no gate answers (no rig on :8090,
+    or llama-swap's 404), so decide works on a Mac without the rig."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8090/hold/status", timeout=3) as r:
+            s = json.load(r)
+        return None if s.get("phase") == "open" else f"GPU hold ({s.get('phase')}): {s.get('why')} (hold status)"
+    except Exception:
+        return None
+
+
+def gpu_holders():
+    """Who holds the GPU: the hold gate, then m3d's guard, which knows every heavy job on this Mac (llama-swap,
+    ds4/llama engines, LTX renders, ComfyUI, Hunyuan3D, mflux...)."""
+    held = hold_holder()
+    return ([held] if held else []) + other_holders()
+
+
+def other_holders():
+    m3d = shutil.which("m3d")
+    if m3d:
+        try:
+            r = subprocess.run([m3d, "gpu", "--json"], capture_output=True, text=True, timeout=60)
+            return json.loads(r.stdout)["holders"]
+        except Exception as e:
+            log(f"[gpu] m3d gpu failed ({e}); falling back to llama-swap and engine processes")
+    holders = []
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8090/running", timeout=3) as r:
+            holders += [f"llama-swap has {m.get('model')} loaded" for m in json.load(r).get("running", [])]
+    except Exception:
+        pass
+    ps = subprocess.run(["pgrep", "-fl", "ds4-server|llama-server|clef_mlx.py|ltx-2-mlx"],
+                        capture_output=True, text=True).stdout
+    holders += [l for l in ps.splitlines() if l.strip()]
+    return holders
+
+
+# ---------- server state ----------
+def proc_state(pid):
+    """'' if gone, 'Z' if exited but not reaped, else the ps stat letters."""
+    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return out.strip()
+
+
+def current():
+    """The live server's state record, or None. A stale record (process gone) is removed."""
+    if not STATE.exists():
+        return None
+    st = json.loads(STATE.read_text())
+    s = proc_state(st["pid"])
+    if not s or s.startswith("Z"):
+        STATE.unlink(missing_ok=True)
+        return None
+    return st
+
+
+def http(method, path, body=None, timeout=600):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base_url() + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"error": raw.decode(errors="replace")[:500]}
+
+
+def wired_gb():
+    """System-wide wired memory in GB (vm_stat). Metal model weights and buffers count here."""
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(out.split("page size of ")[1].split()[0])
+    wired = int(next(l for l in out.splitlines() if l.startswith("Pages wired down")).split()[-1].rstrip("."))
+    return round(page * wired / 1e9, 1)
+
+
+def port_in_use():
+    with socket.socket() as s:
+        s.settimeout(1)
+        return s.connect_ex((SRV["host"], int(SRV["port"]))) == 0
+
+
+def serve(target, force=False):
+    """Start TARGET and wait until it answers. Returns (state, started_here)."""
+    r = row(target)
+    st = current()
+    if st:
+        if st["target"] == target:
+            log(f"{target} is already serving on {base_url()} (pid {st['pid']})")
+            return st, False
+        die(2, f"{st['target']} is serving (pid {st['pid']}); run `decide stop` first")
+    if on_disk(target) is None:
+        die(5, f"{target}: weights missing or incomplete at {weights(target)}; run `decide fetch {target}`")
+    holders = gpu_holders()
+    if holders and not force:
+        die(3, "GPU busy, refusing to load a model (--force only if you know it is safe):\n  "
+            + "\n  ".join(holders))
+    if port_in_use():
+        die(4, f"{base_url()} is already taken by another program")
+    cmd = command(target)
+    wired_before = wired_gb()
+    RUN.mkdir(exist_ok=True)
+    logf = RUN / f"{target}.log"
+    log(f"[serve] {target}: {' '.join(cmd)}")
+    with open(logf, "w") as lf:
+        p = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             cwd=ROOT, start_new_session=True)
+    st = {"target": target, "pid": p.pid, "engine": r["engine"], "url": base_url(),
+          "log": str(logf), "started": dt.datetime.now().isoformat(timespec="seconds"),
+          "wired_before_gb": wired_before}
+    STATE.write_text(json.dumps(st, indent=1) + "\n")
+    t0 = time.time()
+    health = CFG["engines"][r["engine"]]["health"]
+    try:
+        while time.time() - t0 < LOAD_TIMEOUT_S:
+            if p.poll() is not None:
+                STATE.unlink(missing_ok=True)
+                tail = "".join(logf.read_text(errors="replace").splitlines(True)[-25:])
+                die(4, f"{target} exited with code {p.returncode} while loading. Log tail:\n{tail}")
+            try:
+                code, _ = http("GET", health, timeout=5)
+                if code == 200:
+                    st["load_s"] = round(time.time() - t0, 1)
+                    STATE.write_text(json.dumps(st, indent=1) + "\n")
+                    log(f"[serve] {target} ready on {base_url()} after {st['load_s']} s (pid {p.pid}, log {logf})")
+                    return st, True
+            except (urllib.error.URLError, ConnectionError, socket.timeout, OSError):
+                pass
+            time.sleep(2)
+    except KeyboardInterrupt:
+        # The server runs in its own session, so Ctrl-C reaches only us: unload it here.
+        log(f"[serve] interrupted while {target} was loading; stopping it")
+        stop()
+        sys.exit(130)
+    log(f"[serve] {target} not healthy after {LOAD_TIMEOUT_S} s; stopping it")
+    stop()
+    die(4, f"{target} did not become healthy; see {logf}")
+
+
+def stop():
+    st = current()
+    if not st:
+        log("nothing is running")
+        return
+    pid, t0 = st["pid"], time.time()
+    for sig, wait in zip((signal.SIGINT, signal.SIGTERM), STOP_WAIT_S):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            break
+        end = time.time() + wait
+        while time.time() < end:
+            s = proc_state(pid)
+            if not s or s.startswith("Z"):
+                try:
+                    os.waitpid(pid, os.WNOHANG)  # reap it if we started it in this process
+                except ChildProcessError:
+                    pass
+                STATE.unlink(missing_ok=True)
+                log(f"[stop] {st['target']} stopped after {time.time() - t0:.0f} s")
+                return
+            time.sleep(1)
+    die(4, f"{st['target']} (pid {pid}) is still running after SIGINT and SIGTERM. "
+           "Not sending SIGKILL: it leaks wired Metal memory until reboot. Look at it with "
+           f"`ps -p {pid}` and {st['log']}.")
+
+
+# ---------- requests ----------
+def data_url(path):
+    p = Path(path).expanduser()
+    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp",
+            "gif": "image/gif"}.get(p.suffix.lower().lstrip("."), "application/octet-stream")
+    return f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()
+
+
+def json_arg(value):
+    if value == "-":
+        return json.load(sys.stdin)
+    p = Path(value).expanduser()
+    if len(value) < 1024 and p.is_file():
+        return json.loads(p.read_text())
+    return json.loads(value)
+
+
+def ask(request, images=()):
+    st = current() or die(2, "nothing is running; `decide serve [TARGET]` first")
+    req = dict(request)
+    req.setdefault("model", st["target"])
+    if images:
+        req["images"] = list(req.get("images", [])) + [data_url(i) for i in images]
+    t0 = time.perf_counter()
+    try:
+        code, body = http("POST", "/v1/systemone", req)
+    except (urllib.error.URLError, ConnectionError, socket.timeout, OSError) as e:
+        code, body = 599, {"error": f"no answer from {base_url()}: {e}"}
+    return code, body, (time.perf_counter() - t0) * 1000
+
+
+# ---------- smoke ----------
+def check(expect, answer):
+    """(passed, shown) for one expectation against one answer."""
+    t = answer.get("type")
+    if t == "choice":
+        probs = answer.get("probabilities", {})
+        ok_sum = abs(sum(probs.values()) - 1) < 0.02
+        got = answer.get("choice")
+        return got == expect and ok_sum, f"{got} ({probs.get(got, 0):.3f})"
+    if t == "noul":
+        p = answer.get("noul")
+        if not isinstance(p, (int, float)) or not 0 <= p <= 1:
+            return False, f"bad noul {p!r}"
+        return (p > 0.5) == expect, f"{p:.3f}"
+    if t == "score":
+        s = answer.get("score")
+        if not isinstance(s, (int, float)):
+            return False, f"bad score {s!r}"
+        op, bound = (expect[:2], expect[2:]) if expect[:2] in (">=", "<=") else (expect[:1], expect[1:])
+        ok = {">=": s >= float(bound), "<=": s <= float(bound), ">": s > float(bound), "<": s < float(bound)}[op]
+        return ok, f"{s:.2f}"
+    return False, f"unexpected answer {answer!r}"
+
+
+def smoke():
+    st = current() or die(2, "nothing is running; `decide serve [TARGET]` first")
+    target = st["target"]
+    inputs = set(row(target).get("inputs", ["text"]))
+    cases = json.loads(SMOKE.read_text())["cases"]
+    passed = total = 0
+    lat, skipped, failures = [], [], []
+    print(f"smoke: {target} ({row(target)['label']}) at {st['url']}")
+    for case in cases:
+        if case.get("images") and "image" not in inputs:
+            skipped.append(case["name"])
+            continue
+        imgs = [ROOT / "tests" / i for i in case.get("images", [])]
+        code, body, ms = ask(case["request"], imgs)
+        if code != 200:
+            total += len(case["expect"])
+            failures.append(f"{case['name']}: HTTP {code} {json.dumps(body)[:300]}")
+            print(f"  FAIL {case['name']}: HTTP {code} {json.dumps(body)[:300]}")
+            continue
+        lat.append(ms)
+        for qid, exp in case["expect"].items():
+            total += 1
+            ok, shown = check(exp, body.get("answers", {}).get(qid, {}))
+            passed += ok
+            if not ok:
+                failures.append(f"{case['name']}/{qid}: expected {exp}, got {shown}")
+            print(f"  {'ok  ' if ok else 'FAIL'} {case['name']:<30} {qid:<8} expected {str(exp):<10} got {shown}"
+                  f"   [{ms:.0f} ms, {body.get('usage', {}).get('input_tokens', '?')} tok]")
+    med = statistics.median(lat) if lat else 0
+    print(f"smoke: {passed}/{total} checks passed; request latency median {med:.0f} ms, max {max(lat or [0]):.0f} ms"
+          + (f"; skipped (no image input): {', '.join(skipped)}" if skipped else ""))
+    new = not RUNS.exists()
+    RUNS.parent.mkdir(exist_ok=True)
+    with RUNS.open("a") as f:
+        if new:
+            f.write("date\ttarget\tengine\tweights\tpassed\ttotal\tmedian_ms\tmax_ms\tload_s\tfailures\n")
+        f.write("\t".join(map(str, [dt.datetime.now().isoformat(timespec="seconds"), target, st["engine"],
+                                    weights(target).name, passed, total, round(med), round(max(lat or [0])),
+                                    st.get("load_s", ""), "; ".join(failures)[:500]])) + "\n")
+    if passed == total and total:
+        print(f"smoke: evidence for models.toml trust = \"verified {passed}/{total}\" is the last line of {RUNS}")
+    return passed == total and total > 0
+
+
+# ---------- fetch ----------
+def fetch(target):
+    r = row(target)
+    w = weights(target)
+    dest = w if r["engine"] == "mlx" else w.parent
+    hf = shutil.which("hf") or die(2, "the `hf` CLI is not on PATH")
+    cmd = [hf, "download", r["repo"], *r.get("files", []), "--revision", r["revision"], "--local-dir", str(dest)]
+    if not r.get("files"):
+        cmd += ["--exclude", "__pycache__/*"]
+    log(f"[fetch] {target}: {' '.join(cmd)}")
+    if subprocess.run(cmd).returncode != 0:
+        die(4, f"{target}: download failed")
+    log(f"[fetch] {target}: {on_disk(target) or 0:.1f} GB at {dest}")
+
+
+# ---------- CLI ----------
+def main(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    flags = {a for a in argv if a.startswith("--")}
+    force = "--force" in flags
+    if not args or args[0] in ("-h", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd == "list":
+        print(f"{'target':<16} {'engine':<6} {'inputs':<11} {'on disk':>8}  {'trust':<14} label")
+        for t, r in MODELS.items():
+            size = on_disk(t)
+            print(f"{t:<16} {r['engine']:<6} {','.join(r.get('inputs', [])):<11} "
+                  f"{(f'{size:.1f} GB' if size else 'missing'):>8}  {r['trust']:<14} {r['label']}")
+        st = current()
+        print(f"\nrunning: {st['target']} on {st['url']} (pid {st['pid']})" if st else "\nrunning: nothing")
+    elif cmd == "gpu":
+        h = gpu_holders()
+        print("GPU free" if not h else "GPU busy:\n  " + "\n  ".join(h))
+        return 3 if h else 0
+    elif cmd == "serve":
+        serve(rest[0] if rest else SRV["default"], force)
+    elif cmd == "status":
+        st = current()
+        if not st:
+            print("nothing is running")
+            return 0
+        rss = subprocess.run(["ps", "-o", "rss=", "-p", str(st["pid"])], capture_output=True, text=True).stdout.strip()
+        print(f"{st['target']} ({st['engine']}) on {st['url']}, pid {st['pid']}, since {st['started']}, "
+              f"RSS {int(rss or 0) / 1e6:.1f} GB, log {st['log']}")
+    elif cmd == "stop":
+        stop()
+    elif cmd == "ask":
+        if not rest:
+            die(2, "usage: decide ask REQUEST [--image FILE]...")
+        images = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--image"]
+        request = json_arg(rest[0])
+        code, body, ms = ask(request, images)
+        print(json.dumps(body, indent=2, ensure_ascii=False))
+        log(f"[ask] HTTP {code} in {ms:.0f} ms")
+        return 0 if code == 200 else 4
+    elif cmd == "smoke":
+        return 0 if smoke() else 1
+    elif cmd == "test":
+        want = rest[0] if rest else SRV["default"]
+        targets = [t for t in MODELS if on_disk(t)] if want == "all" else [want]
+        if not targets:
+            die(5, "no target has its weights on disk; run `decide fetch all`")
+        results = {}
+        for t in targets:
+            _, started = serve(t, force)
+            try:
+                results[t] = smoke()
+            finally:
+                if started:
+                    stop()
+        print("\ntest: " + ", ".join(f"{t} {'PASS' if ok else 'FAIL'}" for t, ok in results.items()))
+        return 0 if all(results.values()) else 1
+    elif cmd == "fetch":
+        want = rest[0] if rest else SRV["default"]
+        for t in (MODELS if want == "all" else [want]):
+            if on_disk(t):
+                log(f"[fetch] {t}: already on disk ({on_disk(t):.1f} GB)")
+            else:
+                fetch(t)
+    else:
+        die(2, f"unknown command {cmd!r}; `decide help` lists them")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

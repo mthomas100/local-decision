@@ -1,0 +1,57 @@
+{
+ "target": "clef-mlx",
+ "engine": "mlx",
+ "load_s": 6.0,
+ "weights": "~/models/clef-mlx-8bit",
+ "finished": "2026-10-03T20:33:36",
+ "suites": {
+  "banking77": {
+   "items": 77,
+   "errors": 0,
+   "seconds": 207.9
+  },
+  "sms-spam": {
+   "items": 150,
+   "errors": 0,
+   "seconds": 51.6
+  },
+  "halueval-qa": {
+   "items": 150,
+   "errors": 0,
+   "seconds": 69.8
+  },
+  "shell-success": {
+   "items": 41,
+   "errors": 0,
+   "seconds": 14.4
+  },
+  "latency": {
+   "items": 12,
+   "errors": 0,
+   "seconds": 88.0
+  },
+  "render-qa": {
+   "items": 36,
+   "errors": 0,
+   "seconds": 53.1
+  },
+  "subject-match": {
+   "items": 20,
+   "errors": 0,
+   "seconds": 32.8
+  },
+  "count-shapes": {
+   "items": 24,
+   "errors": 0,
+   "seconds": 19.2
+  },
+  "frame-checks": {
+   "items": 4,
+   "errors": 0,
+   "seconds": 5.2
+  }
+ },
+ "peak_rss_gb": 31.0,
+ "peak_wired_gb": 40.1,
+ "wired_before_gb": 7.1
+}

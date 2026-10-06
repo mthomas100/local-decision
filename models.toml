@@ -1,0 +1,103 @@
+# models.toml — the registry of local decision models. bin/decide reads only this file.
+#
+# A decision model answers typed questions about a state (POST /v1/systemone, the
+# Jev/SystemOne API) with a probability for every option, in one forward pass. It never
+# generates text. That is why these rows live here and not in a chat-model registry: if you run a
+# llama-swap (or similar) front end for chat models, every model listed there is offered to chat
+# clients as a chat model, and a Clef server cannot chat (decided 2026-10-03).
+#
+# To add a model: add one [models.<target>] row, run `decide fetch <target>`, then
+# `decide test <target>`. Set trust to "verified N/N" only from a `decide smoke` result
+# (bench/runs.tsv); never by hand without evidence.
+#
+# Placeholders: {root} this repo, {models} [paths].models, and any [server] key.
+
+[paths]
+models = "~/models"
+# llama.cpp gained Clef in b11371 (PR #29831, merged 2026-10-03, text only). This build is
+# kept apart from any other llama.cpp build on the Mac (for example one that serves chat
+# models), so upgrading one never changes the other.
+llama_server = "{root}/vendor/llama-b11379/llama-server"
+# mlx 0.32.3, mlx-lm 0.32.0, mlx-vlm 0.7.4: the versions clef_mlx.py was tested with
+# (mlx-community model card, 2026-10-02). It warns when the minor version differs.
+python = "{root}/.venv/bin/python"
+
+[server]
+host = "127.0.0.1"
+port = 8097        # free on 2026-10-03; a llama-swap front end commonly sits on 8090, its children on 5800 and up
+default = "clef"
+
+[engines.llama]
+# Clef evaluates the whole prompt in one batch, which must fit in --ubatch-size
+# (tools/server/README.md, b11379), so batch = ubatch = ctx. --parallel 1 because the
+# Clef graph handles one sequence per batch (PR #29831, "known limitations").
+cmd = ["{llama_server}", "-m", "{weights}", "--host", "{host}", "--port", "{port}",
+       "--ctx-size", "{ctx}", "--batch-size", "{ctx}", "--ubatch-size", "{ctx}",
+       "--parallel", "1", "--no-webui"]
+health = "/health"
+
+[engines.mlx]
+# The port's own server. --no-truncate gives a 413 for an over-long input, the way
+# llama-server refuses one, instead of silently cutting the state as the reference does.
+cmd = ["{python}", "{weights}/clef_mlx.py", "serve", "--model", "{weights}",
+       "--name", "{target}", "--host", "{host}", "--port", "{port}",
+       "--max-length", "{ctx}", "--no-truncate"]
+health = "/health"
+
+# ctx 16384 everywhere: the joint head was trained at 16k tokens (Cloudflare reference
+# max_length; the MLX card). The blog quotes a 64k window. Raise ctx in a row only after
+# a smoke run at that size.
+
+[models.clef]
+engine = "llama"
+label = "Clef 27B, Q8_0 GGUF"
+use = "the more precise model; text only (llama.cpp has no Clef vision yet)"
+weights = "{models}/clef-gguf/Clef-Q8_0.gguf"
+repo = "ggml-org/Clef-GGUF"
+revision = "5f70656b6670c65eb85ad07a11efe211b5f211bd"
+files = ["Clef-Q8_0.gguf", "README.md", ".src_sha"]
+upstream = "Cloudflare/clef@2f3de3dd85f379784083b0814d997ab627200f0c"
+ctx = 16384
+inputs = ["text"]
+license = "Apache-2.0"
+trust = "verified 12/12"   # decide smoke, bench/runs.tsv 2026-10-03; use cases in bench/results/2026-10-03/REPORT.md
+
+[models.clef-flash]
+engine = "llama"
+label = "Clef-Flash 9B, Q8_0 GGUF"
+use = "the fast model (Cloudflare: 38.8 ms median vs 209.3 ms, https://blog.cloudflare.com/clef-decision-models); text only"
+weights = "{models}/clef-flash-gguf/Clef-Flash-Q8_0.gguf"
+repo = "ggml-org/Clef-Flash-GGUF"
+revision = "4a7a08c09bc63baf043b62b5ba89dd67a0357d95"
+files = ["Clef-Flash-Q8_0.gguf", "README.md", ".src_sha"]
+upstream = "Cloudflare/clef-flash@17f0b0ad64efb65d273590632833508766b2aae6"
+ctx = 16384
+inputs = ["text"]
+license = "Apache-2.0"
+trust = "verified 12/12"   # decide smoke, bench/runs.tsv 2026-10-03; use cases in bench/results/2026-10-03/REPORT.md
+
+[models.clef-mlx]
+engine = "mlx"
+label = "Clef 27B, MLX 8-bit"
+use = "images; the 8-bit port tracks the PyTorch reference within 0.007 (its card)"
+weights = "{models}/clef-mlx-8bit"
+repo = "mlx-community/clef-8bit"
+revision = "ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1"
+upstream = "Cloudflare/clef@2f3de3dd85f379784083b0814d997ab627200f0c"
+ctx = 16384
+inputs = ["text", "image"]
+license = "Apache-2.0"
+trust = "verified 16/16"   # decide smoke, bench/runs.tsv 2026-10-03; use cases in bench/results/2026-10-03/REPORT.md
+
+[models.clef-flash-mlx]
+engine = "mlx"
+label = "Clef-Flash 9B, MLX 8-bit"
+use = "images, fast"
+weights = "{models}/clef-flash-mlx-8bit"
+repo = "mlx-community/clef-flash-8bit"
+revision = "dfa0993decb4f8507a0eae01afd1b2d33a4bb734"
+upstream = "Cloudflare/clef-flash@17f0b0ad64efb65d273590632833508766b2aae6"
+ctx = 16384
+inputs = ["text", "image"]
+license = "Apache-2.0"
+trust = "verified 16/16"   # decide smoke, bench/runs.tsv 2026-10-03; use cases in bench/results/2026-10-03/REPORT.md

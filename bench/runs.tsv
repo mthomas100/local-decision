@@ -1,0 +1,5 @@
+date	target	engine	weights	passed	total	median_ms	max_ms	load_s	failures
+2026-10-03T19:41:47	clef-flash	llama	Clef-Flash-Q8_0.gguf	12	12	272	451	4.0	
+2026-10-03T19:51:37	clef	llama	Clef-Q8_0.gguf	12	12	668	737	6.0	
+2026-10-03T20:21:45	clef-flash-mlx	mlx	clef-flash-mlx-8bit	16	16	174	770	6.0	
+2026-10-03T20:24:33	clef-mlx	mlx	clef-mlx-8bit	16	16	502	694	6.0	

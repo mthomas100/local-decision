@@ -1,0 +1,52 @@
+{
+ "target": "clef",
+ "engine": "llama",
+ "load_s": 6.0,
+ "weights": "~/models/clef-gguf/Clef-Q8_0.gguf",
+ "finished": "2026-10-03T20:21:36",
+ "suites": {
+  "banking77": {
+   "items": 77,
+   "errors": 0,
+   "seconds": 248.1
+  },
+  "banking77-reversed": {
+   "items": 77,
+   "errors": 0,
+   "seconds": 241.5
+  },
+  "clinc-oos": {
+   "items": 180,
+   "errors": 0,
+   "seconds": 1014.1
+  },
+  "sms-spam": {
+   "items": 150,
+   "errors": 0,
+   "seconds": 60.3
+  },
+  "sms-spam-injected": {
+   "items": 75,
+   "errors": 0,
+   "seconds": 30.9
+  },
+  "halueval-qa": {
+   "items": 150,
+   "errors": 0,
+   "seconds": 79.2
+  },
+  "shell-success": {
+   "items": 41,
+   "errors": 0,
+   "seconds": 17.2
+  },
+  "latency": {
+   "items": 12,
+   "errors": 0,
+   "seconds": 106.9
+  }
+ },
+ "peak_rss_gb": 41.7,
+ "peak_wired_gb": 41.9,
+ "wired_before_gb": 7.1
+}

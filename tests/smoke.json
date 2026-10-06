@@ -1,0 +1,98 @@
+{
+  "about": "Planted controls for `decide smoke` (written 2026-10-03). Each case has one answer that is not in doubt, plus a matching control that must come out the other way. A working decision model passes every case with a margin. A broken pipeline fails them: a chat-mode GGUF without the decision head, a wrong prompt layout or a mis-scaled head. expect: choice = the top option; noul = true or false, meaning noul > 0.5 or < 0.5; score = a bound on the expected level such as \">=2\". Cases with `images` run only on targets whose inputs include image.",
+  "cases": [
+    {
+      "name": "refund-routing",
+      "request": {
+        "state": "Customer message: I was charged twice for order #4471 and I want my money back.",
+        "questions": {
+          "team": {"type": "choice", "instructions": "Which team should handle this?",
+                   "criteria": {"billing": "payments, charges, refunds, invoices",
+                                "shipping": "delivery, tracking, lost or late parcels",
+                                "technical": "bugs, errors, outages, login problems"}},
+          "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}
+        }
+      },
+      "expect": {"team": "billing", "refund": true}
+    },
+    {
+      "name": "outage",
+      "request": {
+        "state": "Since 09:00 every checkout attempt returns HTTP 500 and no customer can place an order.",
+        "questions": {
+          "team": {"type": "choice", "instructions": "Which team should handle this?",
+                   "criteria": {"billing": "payments, charges, refunds, invoices",
+                                "shipping": "delivery, tracking, lost or late parcels",
+                                "technical": "bugs, errors, outages, login problems"}},
+          "outage": {"type": "noul", "instructions": "Is a service down?"},
+          "urgency": {"type": "score", "instructions": "How urgent is this?",
+                      "criteria": ["can wait", "this week", "today", "right now"]}
+        }
+      },
+      "expect": {"team": "technical", "outage": true, "urgency": ">=2"}
+    },
+    {
+      "name": "happy-customer (control)",
+      "request": {
+        "state": "Customer message: The parcel arrived a day early and everything works perfectly. Thank you!",
+        "questions": {
+          "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+          "outage": {"type": "noul", "instructions": "Is a service down?"},
+          "urgency": {"type": "score", "instructions": "How urgent is this?",
+                      "criteria": ["can wait", "this week", "today", "right now"]}
+        }
+      },
+      "expect": {"angry": false, "outage": false, "urgency": "<1.5"}
+    },
+    {
+      "name": "json-invoice",
+      "request": {
+        "state": {"invoice": {"vendor": "Acme", "total": 1250.0, "currency": "USD", "status": "overdue"}},
+        "questions": {
+          "status": {"type": "choice", "instructions": "What is the invoice status?",
+                     "criteria": {"paid": "Invoice is paid.", "overdue": "Invoice is past due.", "draft": "Not sent."}},
+          "large": {"type": "noul", "instructions": "Is the total above 1000 USD?"}
+        }
+      },
+      "expect": {"status": "overdue", "large": true}
+    },
+    {
+      "name": "json-invoice-small (control)",
+      "request": {
+        "state": {"invoice": {"vendor": "Acme", "total": 250.0, "currency": "USD", "status": "paid"}},
+        "questions": {
+          "status": {"type": "choice", "instructions": "What is the invoice status?",
+                     "criteria": {"paid": "Invoice is paid.", "overdue": "Invoice is past due.", "draft": "Not sent."}},
+          "large": {"type": "noul", "instructions": "Is the total above 1000 USD?"}
+        }
+      },
+      "expect": {"status": "paid", "large": false}
+    },
+    {
+      "name": "image-red-circle",
+      "images": ["red-circle.png"],
+      "request": {
+        "state": "Describe the attached picture.",
+        "questions": {
+          "circle": {"type": "noul", "instructions": "Does the picture show a red circle?"},
+          "shape": {"type": "choice", "instructions": "What shape is in the picture?",
+                    "criteria": {"circle": "a round shape", "square": "a shape with four equal sides", "triangle": "a shape with three sides"}}
+        }
+      },
+      "expect": {"circle": true, "shape": "circle"}
+    },
+    {
+      "name": "image-blue-square (control)",
+      "images": ["blue-square.png"],
+      "request": {
+        "state": "Describe the attached picture.",
+        "questions": {
+          "circle": {"type": "noul", "instructions": "Does the picture show a red circle?"},
+          "shape": {"type": "choice", "instructions": "What shape is in the picture?",
+                    "criteria": {"circle": "a round shape", "square": "a shape with four equal sides", "triangle": "a shape with three sides"}}
+        }
+      },
+      "expect": {"circle": false, "shape": "square"}
+    }
+  ]
+}
