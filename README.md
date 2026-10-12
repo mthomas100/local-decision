@@ -223,7 +223,8 @@ teddy bear with the lower half blacked out (see the hero image).
     about the other heavy local jobs.
 
   Neither one is required. Without them, `decide` falls back to llama-swap's `/running` and a
-  `pgrep` for known model servers. `--force` skips the check.
+  `pgrep -f` for known model servers (`llama-server|clef_mlx.py|ltx-2-mlx`; set
+  `DECIDE_GPU_PGREP` to your own pattern). `--force` skips the check.
 
 ## Setup
 
@@ -299,10 +300,11 @@ bench/run-all.sh                                  # every target: serve, smoke, 
 
 **The suite data is committed** in `bench/data/`, images included, so the suites run as
 shipped. `usecases.py prepare` rebuilds it. The text suites download from the Hugging Face
-datasets server. The image suites are built from local renders, video clips and a concept
-image, which `base_images()` expects under `~/3d/m3d/` and `~/videos/vidgen/`. Those files
-are outputs of the author's local 3D and video pipelines and are not in this repo, so on
-another Mac use the committed images. In the committed `shell-success.jsonl` the account
+datasets server. The image suites are built from renders of generated 3D models, generated
+video clips and a concept image. Those sources are not in this repo, so `prepare` keeps the
+committed `base-*.jpg` for any subject it has no source for. To rebuild from your own images,
+set `DECIDE_BENCH_SOURCES` to a folder with `renders/<subject>.png`, `videos/<subject>.mp4`
+and `concepts/<subject>.png` (subject names as in `bench/data/images/`). In the committed `shell-success.jsonl` the account
 name in the `ls -la` output is replaced with `user`. The model saw the real name.
 `prepare` now does this replacement itself.
 
@@ -336,8 +338,7 @@ wired memory until reboot, so `stop` sends SIGINT, then SIGTERM, and gives up ra
   image suites ran only on MLX, because llama.cpp has no Clef vision yet.
 - The context is held at 16k tokens, the length the joint head was trained at, even though
   Cloudflare's [blog](https://blog.cloudflare.com/clef-decision-models) quotes a 64k window.
-- The repo was built with a coding agent (Claude Code). `CLAUDE.md` holds the working rules it
-  follows here.
+- The repo was built with a coding agent (Claude Code).
 
 ## Credits and licences
 

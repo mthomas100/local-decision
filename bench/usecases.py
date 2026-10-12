@@ -262,21 +262,17 @@ def prep_latency():
 
 
 # ---------------------------------------------------------------- suites: images
-RENDERS = {  # m3d asset renders (three views of a generated 3D model) and their prompt subject
-    "treasure-chest": "20261002-000131-a-stylized-wooden-treasure-chest-with-iron-bands",
-    "robot-mailbox": "20261002-122226-a-cute-robot-mailbox-game-asset",
-    "ship-lantern": "20261002-132601-a-six-sided-brass-ship-s-lantern-with-flat-green",
-    "apothecary-bottle": "20261002-145122-antique-apothecary-bottle-of-dark-green-glass-wi",
-    "toaster-robot": "20261002-162653-a-squat-retro-toaster-robot-brushed-chrome-body-",
-    "teddy-bear-robot": "20261003-110348-a-tiny-cute-teddy-bear-robot-honey-coloured-plus",
-}
-VIDEOS = {  # vidgen clips and the subject their prompt named
-    "golden-retriever-puppy": "20260922-215307-a-golden-retriever-puppy-bounds-through.mp4",
-    "lighthouse-keeper": "20260922-215420-a-weathered-lighthouse-keeper-in-a-yello.mp4",  # no keeper on screen: see FRAME_CHECKS
-    "ice-queen": "20260922-221503-a-pale-ice-queen-in-a-crystalline-silver.mp4",
-    "fashion-model": "20260922-235002-a-surreal-luxury-fashion-commercial-film.mp4",
-}
-CONCEPTS = {"orange-cat": "20261002-121939-an-orange-cat/concept-zimage-turbo-s42.png"}
+# Source images for the image suites. They are outputs of a local text-to-3D pipeline and a local
+# video model, so they are not in the repo; the base-*.jpg made from them are. To rebuild from your own
+# sources, point DECIDE_BENCH_SOURCES at a folder laid out as:
+#   renders/<subject>.png    a render of a generated 3D model (three views on a transparent background)
+#   videos/<subject>.mp4     a generated video clip (the frame at 2 s is used)
+#   concepts/<subject>.png   a generated concept image
+# A subject with no source keeps its committed bench/data/images/base-<subject>.jpg.
+SOURCES = Path(os.environ.get("DECIDE_BENCH_SOURCES", "~/decide-bench-sources")).expanduser()
+RENDERS = ["treasure-chest", "robot-mailbox", "ship-lantern", "apothecary-bottle", "toaster-robot", "teddy-bear-robot"]
+VIDEOS = ["golden-retriever-puppy", "lighthouse-keeper", "ice-queen", "fashion-model"]  # no keeper on screen in the lighthouse clip: see frame-checks
+CONCEPTS = ["orange-cat"]
 SUBJECTS = {"treasure-chest": "a wooden treasure chest", "robot-mailbox": "a robot shaped like a mailbox",
             "ship-lantern": "a brass ship's lantern", "apothecary-bottle": "an antique apothecary bottle",
             "toaster-robot": "a retro toaster robot", "teddy-bear-robot": "a teddy bear robot",
@@ -286,28 +282,40 @@ SUBJECTS = {"treasure-chest": "a wooden treasure chest", "robot-mailbox": "a rob
 
 
 def base_images():
-    """{subject: png path} from this Mac's own renders, frames and concept images."""
+    """{subject: jpg path}: rebuilt from DECIDE_BENCH_SOURCES where a source exists, else the committed base image."""
     from PIL import Image
     IMAGES.mkdir(parents=True, exist_ok=True)
     out = {}
-    for subj, d in RENDERS.items():
-        src = next((Path.home() / "3d" / "m3d" / d).glob("*rendercheck.png"), None)
-        if not src:
-            log(f"[prepare] missing render for {subj}"); continue
+
+    def keep(subj, why):
+        dst = IMAGES / f"base-{subj}.jpg"
+        if dst.exists():
+            out[subj] = dst
+        else:
+            log(f"[prepare] {why} for {subj}, and no committed base image")
+
+    for subj in RENDERS:
+        src = SOURCES / "renders" / f"{subj}.png"
+        if not src.exists():
+            keep(subj, "no render source"); continue
         im = Image.open(src).convert("RGBA")
         bg = Image.new("RGBA", im.size, (255, 255, 255, 255)); bg.alpha_composite(im)
         dst = IMAGES / f"base-{subj}.jpg"; bg.convert("RGB").save(dst, quality=90); out[subj] = dst
-    for subj, f in VIDEOS.items():
-        src = Path.home() / "videos" / "vidgen" / f
+    for subj in VIDEOS:
+        src = SOURCES / "videos" / f"{subj}.mp4"
+        if not src.exists():
+            keep(subj, "no video source"); continue
         dst = IMAGES / f"base-{subj}.jpg"
         r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "2", "-i", str(src), "-frames:v", "1", "-q:v", "3",
                             "-vf", "scale='min(1024,iw)':-2", str(dst)], capture_output=True, text=True)
         if r.returncode == 0 and dst.exists():
             out[subj] = dst
         else:
-            log(f"[prepare] frame from {f} failed: {r.stderr[-200:]}")
-    for subj, f in CONCEPTS.items():
-        src = Path.home() / "3d" / "m3d" / f
+            log(f"[prepare] frame from {src.name} failed: {r.stderr[-200:]}")
+    for subj in CONCEPTS:
+        src = SOURCES / "concepts" / f"{subj}.png"
+        if not src.exists():
+            keep(subj, "no concept source"); continue
         dst = IMAGES / f"base-{subj}.jpg"
         im = Image.open(src).convert("RGB"); im.thumbnail((1024, 1024)); im.save(dst, quality=90); out[subj] = dst
     return out
@@ -345,7 +353,7 @@ def prep_images():
             items.append({"id": f"rqa-{subj}-{v}", "images": [f"images/{name}"], "meta": {"variant": v},
                           "truth": {"broken": broken, "problem": kind},
                           "request": {"state": "A render from a 3D asset pipeline, for quality control.", "questions": q}})
-    write_suite("render-qa", items, "this Mac's m3d renders with planted defects")
+    write_suite("render-qa", items, "renders of generated 3D models with planted defects")
     # 2. subject-match: which prompt subject is this, and does it show X (its own, or another one)?
     crit = dict(SUBJECTS)
     items = []
@@ -360,8 +368,8 @@ def prep_images():
                               "subject": {"type": "choice", "instructions": "What is the main subject of the image?",
                                           "criteria": crit},
                               "shows": {"type": "noul", "instructions": f"Does the image show {SUBJECTS[s]}?"}}}})
-    write_suite("subject-match", items, "this Mac's renders, video frames and concept images; truth = generating prompt")
-    # 2b. frame-checks: what is visibly in four vidgen frames. Truth here is NOT machine-made: it is
+    write_suite("subject-match", items, "generated 3D renders, video frames and a concept image; truth = generating prompt")
+    # 2b. frame-checks: what is visibly in four generated video frames. Truth here is NOT machine-made: it is
     # Claude Code's own look at one-frame-per-second contact strips (2026-10-03). The lighthouse clip
     # was prompted with "a weathered lighthouse keeper" but no person appears in any second of it,
     # which makes it a prompt-adherence probe. Reported separately from the machine-truth suites.
@@ -376,7 +384,7 @@ def prep_images():
               "meta": {"judged_by": "claude-code visual check of a 1 fps contact strip, 2026-10-03"},
               "request": {"state": "A frame from a generated video.", "questions": qs}}
              for subj, truth in checks.items() if subj in bases]
-    write_suite("frame-checks", items, "four vidgen frames; truth from Claude Code's visual check, not machine-made")
+    write_suite("frame-checks", items, "four generated video frames; truth from Claude Code's visual check, not machine-made")
     # 3. count-shapes: k red circles among blue squares.
     items = []
     for k in range(6):

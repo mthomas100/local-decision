@@ -4,7 +4,7 @@
 # Jev/SystemOne API) with a probability for every option, in one forward pass. It never
 # generates text. That is why these rows live here and not in a chat-model registry: if you run a
 # llama-swap (or similar) front end for chat models, every model listed there is offered to chat
-# clients as a chat model, and a Clef server cannot chat (decided 2026-10-03).
+# clients as a chat model, and a Clef server cannot chat.
 #
 # To add a model: add one [models.<target>] row, run `decide fetch <target>`, then
 # `decide test <target>`. Set trust to "verified N/N" only from a `decide smoke` result

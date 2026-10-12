@@ -119,6 +119,11 @@ def base_url():
 
 
 # ---------- GPU guard ----------
+# Processes that count as holding the GPU when m3d is not installed (an extended regex for pgrep -f).
+# Set DECIDE_GPU_PGREP to add your own model servers or render jobs.
+GPU_PGREP = os.environ.get("DECIDE_GPU_PGREP", "llama-server|clef_mlx.py|ltx-2-mlx")
+
+
 def hold_holder():
     """The Mac's GPU hold (2026-10-04, the hold gate in the local-rig repo, docs/hold.md): while a render, an m3d job
     or a person's `hold on` holds the GPU, no model may be loaded, this one included (the rule: nothing forces an LLM
@@ -133,8 +138,8 @@ def hold_holder():
 
 
 def gpu_holders():
-    """Who holds the GPU: the hold gate, then m3d's guard, which knows every heavy job on this Mac (llama-swap,
-    ds4/llama engines, LTX renders, ComfyUI, Hunyuan3D, mflux...)."""
+    """Who holds the GPU: the hold gate, then m3d's guard, which knows the heavy local jobs (llama-swap, llama.cpp
+    servers, video renders, ComfyUI, Hunyuan3D, mflux...), else llama-swap and a pgrep for model servers."""
     held = hold_holder()
     return ([held] if held else []) + other_holders()
 
@@ -153,7 +158,7 @@ def other_holders():
             holders += [f"llama-swap has {m.get('model')} loaded" for m in json.load(r).get("running", [])]
     except Exception:
         pass
-    ps = subprocess.run(["pgrep", "-fl", "ds4-server|llama-server|clef_mlx.py|ltx-2-mlx"],
+    ps = subprocess.run(["pgrep", "-fl", GPU_PGREP],
                         capture_output=True, text=True).stdout
     holders += [l for l in ps.splitlines() if l.strip()]
     return holders
